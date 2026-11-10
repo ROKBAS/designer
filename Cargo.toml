@@ -1,0 +1,23 @@
+[package]
+name = "designer"
+version = "0.1.0"
+edition = "2024"
+description = "Tray application for DDC/CI monitor brightness and contrast control on Windows"
+license = "MIT"
+
+[dependencies]
+# DDC/CI. Only the Windows backend is needed; i2c/nvapi/macos backends stay disabled.
+ddc-hi = { version = "0.4.1", default-features = false, features = ["ddc-winapi"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+single-instance = "0.3"
+tao = "0.37.2"
+thiserror = "2"
+tray-icon = { version = "0.26.1", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
