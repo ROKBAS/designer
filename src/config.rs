@@ -8,16 +8,14 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::monitor::Field;
-
 /// Schema version written to disk.
-pub const CONFIG_VERSION: u32 = 1;
+///
+/// Version 2 removed contrast tracking and the adjustable step/minimum
+/// settings; files written by version 1 still load because unknown fields are
+/// ignored and missing ones fall back to defaults.
+pub const CONFIG_VERSION: u32 = 2;
 
-/// Default brightness/contrast step in percent.
-pub const DEFAULT_STEP_PERCENT: u8 = 5;
-/// Default lower clamp for brightness, so the panel never goes fully black.
-pub const DEFAULT_MIN_PERCENT: u8 = 5;
-/// Default minimum delay between DDC/CI commands per monitor.
+/// Default minimum delay between DDC/CI commands sent to the same monitor.
 pub const DEFAULT_MIN_INTERVAL_MS: u64 = 50;
 
 #[derive(Debug, Error)]
@@ -29,7 +27,7 @@ pub enum ConfigError {
     Parse(#[from] serde_json::Error),
 }
 
-/// Last known-good values for a single monitor.
+/// Last known-good brightness for a single monitor.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedMonitor {
@@ -39,8 +37,6 @@ pub struct SavedMonitor {
     pub description: String,
     /// Last confirmed brightness in percent.
     pub brightness: Option<u8>,
-    /// Last confirmed contrast in percent.
-    pub contrast: Option<u8>,
 }
 
 /// User configuration and persisted monitor state.
@@ -49,13 +45,9 @@ pub struct SavedMonitor {
 pub struct Config {
     /// Schema version of this file.
     pub version: u32,
-    /// Step used by the `+`/`-` menu items.
-    pub step_percent: u8,
-    /// Lower brightness clamp; 5 keeps the screen readable.
-    pub min_percent: u8,
     /// Minimum delay between two DDC/CI commands sent to the same monitor.
     pub min_interval_ms: u64,
-    /// Re-apply saved values on startup.
+    /// Re-apply saved brightness on startup.
     pub restore_on_start: bool,
     /// Saved per-monitor values.
     pub monitors: Vec<SavedMonitor>,
@@ -65,8 +57,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
-            step_percent: DEFAULT_STEP_PERCENT,
-            min_percent: DEFAULT_MIN_PERCENT,
             min_interval_ms: DEFAULT_MIN_INTERVAL_MS,
             restore_on_start: false,
             monitors: Vec::new(),
@@ -124,12 +114,9 @@ impl Config {
     /// Clamp out-of-range values so a hand-edited file cannot break the app.
     pub fn sanitize(&mut self) {
         self.version = CONFIG_VERSION;
-        self.step_percent = self.step_percent.clamp(1, 50);
-        self.min_percent = self.min_percent.min(90);
         self.min_interval_ms = self.min_interval_ms.clamp(20, 1000);
         for monitor in &mut self.monitors {
             monitor.brightness = monitor.brightness.map(|value| value.min(100));
-            monitor.contrast = monitor.contrast.map(|value| value.min(100));
         }
     }
 
@@ -162,15 +149,9 @@ impl Config {
         Ok(())
     }
 
-    /// Record a confirmed value for a monitor. Returns `true` if anything
+    /// Record a confirmed brightness for a monitor. Returns `true` if anything
     /// changed, so callers can avoid redundant disk writes.
-    pub fn update_monitor(
-        &mut self,
-        index: u32,
-        description: &str,
-        field: Field,
-        percent: u8,
-    ) -> bool {
+    pub fn update_monitor(&mut self, index: u32, description: &str, percent: u8) -> bool {
         let position = self
             .monitors
             .iter()
@@ -184,7 +165,6 @@ impl Config {
                     index,
                     description: description.to_owned(),
                     brightness: None,
-                    contrast: None,
                 });
                 self.monitors.len() - 1
             }
@@ -196,23 +176,11 @@ impl Config {
         }
 
         let value = Some(percent.min(100));
-        match field {
-            Field::Brightness => {
-                if monitor.brightness == value {
-                    false
-                } else {
-                    monitor.brightness = value;
-                    true
-                }
-            }
-            Field::Contrast => {
-                if monitor.contrast == value {
-                    false
-                } else {
-                    monitor.contrast = value;
-                    true
-                }
-            }
+        if monitor.brightness == value {
+            false
+        } else {
+            monitor.brightness = value;
+            true
         }
     }
 
@@ -278,8 +246,6 @@ mod tests {
     fn defaults_are_sane() {
         let config = Config::default();
         assert_eq!(config.version, CONFIG_VERSION);
-        assert_eq!(config.step_percent, DEFAULT_STEP_PERCENT);
-        assert_eq!(config.min_percent, DEFAULT_MIN_PERCENT);
         assert_eq!(config.min_interval_ms, DEFAULT_MIN_INTERVAL_MS);
         assert!(!config.restore_on_start);
         assert!(config.monitors.is_empty());
@@ -290,11 +256,9 @@ mod tests {
         let path = temp_config_path("roundtrip");
         let mut config = Config {
             restore_on_start: true,
-            step_percent: 10,
             ..Config::default()
         };
-        assert!(config.update_monitor(0, "Panel A", Field::Brightness, 45));
-        assert!(config.update_monitor(0, "Panel A", Field::Contrast, 60));
+        assert!(config.update_monitor(0, "Panel A", 30));
 
         config.save_to(&path).expect("save");
         let loaded = Config::load_from(&path).expect("load");
@@ -333,7 +297,7 @@ mod tests {
         fs::write(
             &path,
             br#"{
-                "version": 0,
+                "version": 1,
                 "step_percent": 0,
                 "min_percent": 100,
                 "min_interval_ms": 1,
@@ -346,11 +310,8 @@ mod tests {
 
         let config = Config::load_from(&path).expect("load");
         assert_eq!(config.version, CONFIG_VERSION);
-        assert_eq!(config.step_percent, 1);
-        assert_eq!(config.min_percent, 90);
         assert_eq!(config.min_interval_ms, 20);
         assert_eq!(config.monitors[0].brightness, Some(100));
-        assert_eq!(config.monitors[0].contrast, Some(100));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -358,17 +319,17 @@ mod tests {
     #[test]
     fn update_monitor_reports_changes() {
         let mut config = Config::default();
-        assert!(config.update_monitor(1, "Panel", Field::Brightness, 40));
-        assert!(!config.update_monitor(1, "Panel", Field::Brightness, 40));
-        assert!(config.update_monitor(1, "Panel", Field::Contrast, 70));
+        assert!(config.update_monitor(1, "Panel", 40));
+        assert!(!config.update_monitor(1, "Panel", 40));
+        assert!(config.update_monitor(1, "Panel", 70));
         assert_eq!(config.monitors.len(), 1);
     }
 
     #[test]
     fn saved_for_prefers_exact_match() {
         let mut config = Config::default();
-        config.update_monitor(0, "Same", Field::Brightness, 10);
-        config.update_monitor(1, "Same", Field::Brightness, 20);
+        config.update_monitor(0, "Same", 10);
+        config.update_monitor(1, "Same", 20);
 
         assert_eq!(
             config.saved_for(0, "Same").and_then(|m| m.brightness),

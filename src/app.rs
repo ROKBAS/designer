@@ -12,7 +12,7 @@ use tray_icon::menu::{MenuEvent, MenuId};
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::monitor::{Field, MonitorSnapshot, scale};
+use crate::monitor::MonitorSnapshot;
 use crate::tray::Tray;
 use crate::tray::menu::Action;
 use crate::worker::{self, Command, EventSink, WorkerEvent};
@@ -47,7 +47,7 @@ pub fn run() -> AppResult<()> {
     {
         warn!("could not write the initial configuration: {error}");
     }
-    let tray = Tray::new(config.step_percent)?;
+    let tray = Tray::new()?;
 
     let (command_tx, command_rx) = mpsc::channel();
     let worker_proxy = event_loop.create_proxy();
@@ -127,33 +127,22 @@ impl App {
                 self.restore_saved();
                 false
             }
-            Action::Adjust {
-                index,
-                field,
-                delta,
-            } => {
-                let Some(current) = self.tray.as_ref().and_then(|tray| tray.value(index, field))
-                else {
+            Action::SetBrightness { index, percent } => {
+                let Some(current) = self.tray.as_ref().and_then(|tray| tray.value(index)) else {
                     return false;
                 };
 
-                let target = scale::clamp_percent(
-                    i32::from(current) + i32::from(delta),
-                    self.config.min_percent,
-                );
-
-                if target == current {
-                    return false;
-                }
-
+                // Normalise the checkmarks even when the value did not change,
+                // so a stale checkmark cannot survive the click.
                 if let Some(tray) = self.tray.as_mut() {
-                    tray.set_field_value(index, field, Some(target));
+                    tray.set_brightness(index, Some(percent));
                 }
-                let _ = self.commands.send(Command::Set {
-                    index,
-                    field,
-                    percent: target,
-                });
+
+                if current != percent {
+                    let _ = self
+                        .commands
+                        .send(Command::SetBrightness { index, percent });
+                }
                 false
             }
         }
@@ -178,16 +167,7 @@ impl App {
                         changed |= self.config.update_monitor(
                             monitor.index,
                             &monitor.description,
-                            Field::Brightness,
                             brightness,
-                        );
-                    }
-                    if let Some(contrast) = monitor.contrast {
-                        changed |= self.config.update_monitor(
-                            monitor.index,
-                            &monitor.description,
-                            Field::Contrast,
-                            contrast,
                         );
                     }
                 }
@@ -203,110 +183,69 @@ impl App {
                     }
                 }
             }
-            WorkerEvent::ValueConfirmed {
-                index,
-                field,
-                percent,
-            } => {
+            WorkerEvent::BrightnessConfirmed { index, percent } => {
                 if let Some(tray) = self.tray.as_mut() {
-                    tray.set_field_value(index, field, percent);
+                    tray.set_brightness(index, Some(percent));
                 }
 
-                let Some(percent) = percent else {
-                    return;
-                };
-
-                let description = match self
-                    .confirmed
-                    .iter_mut()
-                    .find(|monitor| monitor.index == index)
-                {
+                let description = match self.confirmed.iter_mut().find(|m| m.index == index) {
                     Some(monitor) => {
-                        match field {
-                            Field::Brightness => monitor.brightness = Some(percent),
-                            Field::Contrast => monitor.contrast = Some(percent),
-                        }
+                        monitor.brightness = Some(percent);
                         monitor.description.clone()
                     }
                     None => return,
                 };
 
-                if self
-                    .config
-                    .update_monitor(index, &description, field, percent)
-                {
+                if self.config.update_monitor(index, &description, percent) {
                     self.persist();
                 }
             }
-            WorkerEvent::WriteFailed {
-                index,
-                field,
-                message,
-            } => {
+            WorkerEvent::WriteFailed { index, message } => {
                 warn!(
-                    "monitor {}: writing {} failed: {message}",
-                    index + 1,
-                    field.name()
+                    "monitor {}: writing brightness failed: {message}",
+                    index + 1
                 );
-                // Revert the optimistic label to the last confirmed value.
+                // Revert the optimistic checkmark to the last confirmed value.
                 let fallback = self
                     .confirmed
                     .iter()
                     .find(|monitor| monitor.index == index)
-                    .and_then(|monitor| match field {
-                        Field::Brightness => monitor.brightness,
-                        Field::Contrast => monitor.contrast,
-                    });
+                    .and_then(|monitor| monitor.brightness);
                 if let Some(tray) = self.tray.as_mut() {
-                    tray.set_field_value(index, field, fallback);
+                    tray.set_brightness(index, fallback);
                 }
             }
             WorkerEvent::Info(message) => info!("{message}"),
         }
     }
 
-    /// Re-apply persisted values to every monitor currently connected.
+    /// Re-apply persisted brightness to every monitor currently connected.
     fn restore_saved(&mut self) {
         self.restored_once = true;
 
-        let targets: Vec<(u32, Field, u8)> = {
-            let mut targets = Vec::new();
-            for monitor in &self.confirmed {
-                let Some(saved) = self.config.saved_for(monitor.index, &monitor.description) else {
-                    continue;
-                };
-
-                for (field, value) in [
-                    (Field::Brightness, saved.brightness),
-                    (Field::Contrast, saved.contrast),
-                ] {
-                    let Some(percent) = value else { continue };
-                    let current = match field {
-                        Field::Brightness => monitor.brightness,
-                        Field::Contrast => monitor.contrast,
-                    };
-                    if current != Some(percent) {
-                        targets.push((monitor.index, field, percent));
-                    }
-                }
-            }
-            targets
-        };
+        let config = &self.config;
+        let targets: Vec<(u32, u8)> = self
+            .confirmed
+            .iter()
+            .filter_map(|monitor| {
+                let saved = config.saved_for(monitor.index, &monitor.description)?;
+                let percent = saved.brightness?;
+                (monitor.brightness != Some(percent)).then_some((monitor.index, percent))
+            })
+            .collect();
 
         if targets.is_empty() {
             debug!("nothing to restore");
             return;
         }
 
-        for (index, field, percent) in targets {
+        for (index, percent) in targets {
             if let Some(tray) = self.tray.as_mut() {
-                tray.set_field_value(index, field, Some(percent));
+                tray.set_brightness(index, Some(percent));
             }
-            let _ = self.commands.send(Command::Set {
-                index,
-                field,
-                percent,
-            });
+            let _ = self
+                .commands
+                .send(Command::SetBrightness { index, percent });
         }
     }
 

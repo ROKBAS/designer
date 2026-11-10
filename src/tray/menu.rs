@@ -1,8 +1,16 @@
 //! Tray menu construction and pure formatting helpers.
 
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::monitor::{Field, MonitorSnapshot};
+use crate::monitor::MonitorSnapshot;
+
+/// Percentage step between consecutive brightness entries.
+pub const VALUE_STEP: u8 = 10;
+
+/// Brightness values offered by the menu: 0, 10, ..., 100.
+pub fn brightness_values() -> Vec<u8> {
+    (0..=100).step_by(usize::from(VALUE_STEP)).collect()
+}
 
 /// A resolved menu action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,23 +18,15 @@ pub enum Action {
     Refresh,
     Restore,
     Quit,
-    Adjust {
-        index: u32,
-        field: Field,
-        delta: i16,
-    },
+    SetBrightness { index: u32, percent: u8 },
 }
 
-/// Handles for one monitor's submenu items.
+/// Handles for one monitor's submenu and its brightness entries.
 pub struct MonitorMenu {
     pub index: u32,
-    pub brightness_label: MenuItem,
-    pub brightness_up: MenuItem,
-    pub brightness_down: MenuItem,
-    pub contrast_label: MenuItem,
-    pub contrast_up: MenuItem,
-    pub contrast_down: MenuItem,
-    pub step: u8,
+    pub submenu: Submenu,
+    /// Percentage paired with the check item that selects it.
+    pub values: Vec<(u8, CheckMenuItem)>,
 }
 
 /// Handles for all menu items, kept so labels and actions can be resolved
@@ -45,57 +45,36 @@ pub struct BuiltMenu {
 }
 
 /// Build the tray menu for the given monitors.
-pub fn build(monitors: &[MonitorSnapshot], step: u8, reading: bool) -> BuiltMenu {
+///
+/// Each monitor gets a submenu holding a flat list of brightness values; the
+/// value matching the current brightness carries a checkmark. `reading` is
+/// used for the initial placeholder menu while enumeration runs.
+pub fn build(monitors: &[MonitorSnapshot], reading: bool) -> BuiltMenu {
     let menu = Menu::new();
     let mut entries = Vec::with_capacity(monitors.len());
 
     for (position, monitor) in monitors.iter().enumerate() {
-        let submenu = Submenu::new(monitor_title(monitor, position), true);
+        let submenu = Submenu::new(monitor_title(monitor, position, reading), true);
+        let available = monitor.brightness.is_some();
+        let mut values = Vec::with_capacity(brightness_values().len());
 
-        let brightness_label =
-            MenuItem::new(brightness_text(monitor.brightness, reading), false, None);
-        let brightness_up = MenuItem::new(
-            format!("Brightness +{step}%"),
-            monitor.brightness.is_some(),
-            None,
-        );
-        let brightness_down = MenuItem::new(
-            format!("Brightness -{step}%"),
-            monitor.brightness.is_some(),
-            None,
-        );
-        let contrast_label = MenuItem::new(contrast_text(monitor.contrast, reading), false, None);
-        let contrast_up = MenuItem::new(
-            format!("Contrast +{step}%"),
-            monitor.contrast.is_some(),
-            None,
-        );
-        let contrast_down = MenuItem::new(
-            format!("Contrast -{step}%"),
-            monitor.contrast.is_some(),
-            None,
-        );
+        for percent in brightness_values() {
+            let item = CheckMenuItem::new(
+                format!("{percent}%"),
+                available,
+                monitor.brightness == Some(percent),
+                None,
+            );
+            submenu.append(&item).expect("append brightness value");
+            values.push((percent, item));
+        }
 
-        submenu
-            .append_items(&[&brightness_label, &brightness_up, &brightness_down])
-            .expect("append brightness items");
-        submenu
-            .append(&PredefinedMenuItem::separator())
-            .expect("append monitor separator");
-        submenu
-            .append_items(&[&contrast_label, &contrast_up, &contrast_down])
-            .expect("append contrast items");
         menu.append(&submenu).expect("append monitor submenu");
 
         entries.push(MonitorMenu {
             index: monitor.index,
-            brightness_label,
-            brightness_up,
-            brightness_down,
-            contrast_label,
-            contrast_up,
-            contrast_down,
-            step,
+            submenu,
+            values,
         });
     }
 
@@ -147,65 +126,32 @@ pub fn resolve(handles: &MenuHandles, id: &MenuId) -> Option<Action> {
     }
 
     for monitor in &handles.monitors {
-        let delta = i16::from(monitor.step);
-        if monitor.brightness_up.id() == id {
-            return Some(Action::Adjust {
-                index: monitor.index,
-                field: Field::Brightness,
-                delta,
-            });
-        }
-        if monitor.brightness_down.id() == id {
-            return Some(Action::Adjust {
-                index: monitor.index,
-                field: Field::Brightness,
-                delta: -delta,
-            });
-        }
-        if monitor.contrast_up.id() == id {
-            return Some(Action::Adjust {
-                index: monitor.index,
-                field: Field::Contrast,
-                delta,
-            });
-        }
-        if monitor.contrast_down.id() == id {
-            return Some(Action::Adjust {
-                index: monitor.index,
-                field: Field::Contrast,
-                delta: -delta,
-            });
+        for (percent, item) in &monitor.values {
+            if item.id() == id {
+                return Some(Action::SetBrightness {
+                    index: monitor.index,
+                    percent: *percent,
+                });
+            }
         }
     }
 
     None
 }
 
-/// Text for the brightness status item.
-pub fn brightness_text(value: Option<u8>, reading: bool) -> String {
-    field_text("Brightness", value, reading)
-}
-
-/// Text for the contrast status item.
-pub fn contrast_text(value: Option<u8>, reading: bool) -> String {
-    field_text("Contrast", value, reading)
-}
-
-fn field_text(name: &str, value: Option<u8>, reading: bool) -> String {
-    match (value, reading) {
-        (Some(value), _) => format!("{name}: {value}%"),
-        (None, true) => format!("{name}: reading..."),
-        (None, false) => format!("{name}: unavailable"),
-    }
-}
-
-/// Title of a monitor submenu.
-pub fn monitor_title(monitor: &MonitorSnapshot, position: usize) -> String {
+/// Title of a monitor submenu, including its current brightness.
+pub fn monitor_title(monitor: &MonitorSnapshot, position: usize, reading: bool) -> String {
     let description = monitor.description.trim();
-    if description.is_empty() {
+    let base = if description.is_empty() {
         format!("Display {}", position + 1)
     } else {
         format!("Display {}: {description}", position + 1)
+    };
+
+    match monitor.brightness {
+        Some(value) => format!("{base} — {value}%"),
+        None if reading => format!("{base} — reading..."),
+        None => format!("{base} — unavailable"),
     }
 }
 
@@ -234,40 +180,52 @@ pub fn tooltip_text(monitors: &[MonitorSnapshot]) -> String {
 mod tests {
     use super::*;
 
-    fn snapshot(index: u32, brightness: Option<u8>, contrast: Option<u8>) -> MonitorSnapshot {
+    fn snapshot(index: u32, brightness: Option<u8>) -> MonitorSnapshot {
         MonitorSnapshot {
             index,
             description: "Test Panel".to_owned(),
             backend: "test".to_owned(),
             brightness,
             brightness_max: Some(100),
-            contrast,
-            contrast_max: Some(100),
         }
     }
 
     #[test]
-    fn field_text_formats_all_states() {
-        assert_eq!(brightness_text(Some(45), false), "Brightness: 45%");
-        assert_eq!(brightness_text(Some(100), true), "Brightness: 100%");
-        assert_eq!(brightness_text(None, true), "Brightness: reading...");
-        assert_eq!(brightness_text(None, false), "Brightness: unavailable");
-        assert_eq!(contrast_text(Some(60), false), "Contrast: 60%");
+    fn brightness_values_cover_zero_to_hundred_in_tens() {
+        assert_eq!(
+            brightness_values(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        );
     }
 
     #[test]
-    fn monitor_title_is_numbered_and_falls_back() {
-        let mut monitor = snapshot(0, Some(50), Some(50));
-        assert_eq!(monitor_title(&monitor, 0), "Display 1: Test Panel");
-        monitor.description.clear();
-        assert_eq!(monitor_title(&monitor, 1), "Display 2");
+    fn monitor_title_shows_current_value() {
+        let monitor = snapshot(0, Some(70));
+        assert_eq!(
+            monitor_title(&monitor, 0, false),
+            "Display 1: Test Panel — 70%"
+        );
+
+        let unavailable = snapshot(0, None);
+        assert_eq!(
+            monitor_title(&unavailable, 0, true),
+            "Display 1: Test Panel — reading..."
+        );
+        assert_eq!(
+            monitor_title(&unavailable, 0, false),
+            "Display 1: Test Panel — unavailable"
+        );
+
+        let mut unnamed = snapshot(1, Some(0));
+        unnamed.description.clear();
+        assert_eq!(monitor_title(&unnamed, 1, false), "Display 2 — 0%");
     }
 
     #[test]
     fn tooltip_handles_empty_and_multiple_monitors() {
         assert_eq!(tooltip_text(&[]), "DDC/CI brightness: no monitors detected");
 
-        let monitors = vec![snapshot(0, Some(45), Some(60)), snapshot(1, None, Some(10))];
+        let monitors = vec![snapshot(0, Some(45)), snapshot(1, None)];
         assert_eq!(tooltip_text(&monitors), "Brightness 1: 45% | 2: n/a");
     }
 }

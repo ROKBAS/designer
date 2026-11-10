@@ -11,8 +11,10 @@ use ddc_hi::{Ddc, Display};
 use log::{debug, info, warn};
 use thiserror::Error;
 
-use super::Field;
 use super::scale;
+
+/// VESA MCCS VCP code for brightness.
+pub const BRIGHTNESS_VCP: u8 = 0x10;
 
 /// Errors produced while talking to a monitor.
 #[derive(Debug, Error)]
@@ -23,8 +25,8 @@ pub enum MonitorError {
     #[error("DDC/CI command failed for monitor {index}: {message}")]
     Command { index: u32, message: String },
 
-    #[error("monitor {index} reports no usable range for {field}")]
-    NoRange { index: u32, field: &'static str },
+    #[error("monitor {index} reports no usable brightness range")]
+    NoRange { index: u32 },
 }
 
 /// Plain-data view of a monitor, safe to send to the UI thread.
@@ -40,10 +42,6 @@ pub struct MonitorSnapshot {
     pub brightness: Option<u8>,
     /// Raw maximum reported for brightness, when known.
     pub brightness_max: Option<u16>,
-    /// Current contrast in percent, `None` when unreadable.
-    pub contrast: Option<u8>,
-    /// Raw maximum reported for contrast, when known.
-    pub contrast_max: Option<u16>,
 }
 
 struct Entry {
@@ -54,8 +52,8 @@ struct Entry {
     last_command: Option<Instant>,
     failures: u32,
     cooldown_until: Option<Instant>,
-    /// Cached maxima for brightness and contrast.
-    maximum: [Option<u16>; 2],
+    /// Cached raw maximum reported for brightness.
+    maximum: Option<u16>,
 }
 
 /// Owns DDC/CI display handles and serialises every VCP command.
@@ -94,15 +92,15 @@ impl MonitorController {
                 last_command: None,
                 failures: 0,
                 cooldown_until: None,
-                maximum: [None, None],
+                maximum: None,
             });
         }
         self.entries.len()
     }
 
-    /// Read the current value of a field in percent. `Ok(None)` means the
-    /// feature exists but reports no usable range.
-    pub fn read(&mut self, index: u32, field: Field) -> Result<Option<u8>, MonitorError> {
+    /// Read the current brightness in percent. `Ok(None)` means the monitor
+    /// reports no usable range.
+    pub fn read(&mut self, index: u32) -> Result<Option<u8>, MonitorError> {
         let position = self.position(index)?;
 
         if let Some(until) = self.entries[position].cooldown_until
@@ -116,9 +114,9 @@ impl MonitorController {
             });
         }
 
-        match self.read_feature(position, field) {
+        match self.read_feature(position) {
             Ok((maximum, current)) => {
-                self.entries[position].maximum[slot(field)] = Some(maximum);
+                self.entries[position].maximum = Some(maximum);
                 self.note_success(position);
                 Ok(scale::raw_to_percent(current, maximum))
             }
@@ -129,26 +127,22 @@ impl MonitorController {
         }
     }
 
-    /// Write a field in percent. The value is scaled to the monitor's raw
-    /// range and clamped there as well.
-    pub fn set(&mut self, index: u32, field: Field, percent: u8) -> Result<(), MonitorError> {
+    /// Write brightness as a percentage, scaled to the monitor's raw range.
+    pub fn set(&mut self, index: u32, percent: u8) -> Result<(), MonitorError> {
         let position = self.position(index)?;
-        let maximum = self.maximum(position, field)?;
+        let maximum = self.maximum(position)?;
         let raw = scale::percent_to_raw(percent, maximum);
 
         self.wait_for_slot(position);
         let result = self.entries[position]
             .display
             .handle
-            .set_vcp_feature(field.vcp_code(), raw);
+            .set_vcp_feature(BRIGHTNESS_VCP, raw);
 
         match result {
             Ok(()) => {
                 self.note_success(position);
-                debug!(
-                    "monitor {index}: set {} to {percent}% (raw {raw}/{maximum})",
-                    field.name()
-                );
+                debug!("monitor {index}: set brightness to {percent}% (raw {raw}/{maximum})");
                 Ok(())
             }
             Err(error) => {
@@ -161,7 +155,7 @@ impl MonitorController {
         }
     }
 
-    /// Read both fields for every monitor, isolating per-monitor failures.
+    /// Read brightness for every monitor, isolating per-monitor failures.
     pub fn snapshot(&mut self) -> Vec<MonitorSnapshot> {
         let mut snapshots = Vec::with_capacity(self.entries.len());
 
@@ -170,17 +164,10 @@ impl MonitorController {
             let description = self.entries[position].description.clone();
             let backend = self.entries[position].backend.clone();
 
-            let brightness = match self.read(index, Field::Brightness) {
+            let brightness = match self.read(index) {
                 Ok(value) => value,
                 Err(error) => {
                     debug!("monitor {index}: brightness unavailable: {error}");
-                    None
-                }
-            };
-            let contrast = match self.read(index, Field::Contrast) {
-                Ok(value) => value,
-                Err(error) => {
-                    debug!("monitor {index}: contrast unavailable: {error}");
                     None
                 }
             };
@@ -190,16 +177,14 @@ impl MonitorController {
                 description,
                 backend,
                 brightness,
-                brightness_max: self.entries[position].maximum[0],
-                contrast,
-                contrast_max: self.entries[position].maximum[1],
+                brightness_max: self.entries[position].maximum,
             });
         }
 
         snapshots
     }
 
-    /// Human readable diagnostic dump including raw VCP values.
+    /// Human readable diagnostic dump including the raw VCP value.
     ///
     /// Used by the `--dump` command line switch. It bypasses the failure
     /// backoff so repeated diagnostics always attempt every read.
@@ -223,19 +208,16 @@ impl MonitorController {
                 index + 1
             ));
 
-            for field in Field::ALL {
-                match self.read_feature(position, field) {
-                    Ok((maximum, current)) => {
-                        let percent = scale::raw_to_percent(current, maximum)
-                            .map(|value| format!("{value}%"))
-                            .unwrap_or_else(|| "unavailable".to_owned());
-                        output.push_str(&format!(
-                            "  {}: raw {current}/{maximum} ({percent})\n",
-                            field.name()
-                        ));
-                    }
-                    Err(error) => output.push_str(&format!("  {}: error: {error}\n", field.name())),
+            match self.read_feature(position) {
+                Ok((maximum, current)) => {
+                    let percent = scale::raw_to_percent(current, maximum)
+                        .map(|value| format!("{value}%"))
+                        .unwrap_or_else(|| "unavailable".to_owned());
+                    output.push_str(&format!(
+                        "  Brightness: raw {current}/{maximum} ({percent})\n"
+                    ));
                 }
+                Err(error) => output.push_str(&format!("  Brightness: error: {error}\n")),
             }
         }
 
@@ -260,14 +242,14 @@ impl MonitorController {
         self.entries[position].last_command = Some(Instant::now());
     }
 
-    fn read_feature(&mut self, position: usize, field: Field) -> Result<(u16, u16), MonitorError> {
+    fn read_feature(&mut self, position: usize) -> Result<(u16, u16), MonitorError> {
         self.wait_for_slot(position);
         let index = self.entries[position].index;
 
         let value = self.entries[position]
             .display
             .handle
-            .get_vcp_feature(field.vcp_code())
+            .get_vcp_feature(BRIGHTNESS_VCP)
             .map_err(|error| MonitorError::Command {
                 index,
                 message: format!("{error:#}"),
@@ -278,20 +260,19 @@ impl MonitorController {
         Ok((maximum, current))
     }
 
-    fn maximum(&mut self, position: usize, field: Field) -> Result<u16, MonitorError> {
-        if let Some(maximum) = self.entries[position].maximum[slot(field)] {
+    fn maximum(&mut self, position: usize) -> Result<u16, MonitorError> {
+        if let Some(maximum) = self.entries[position].maximum
+            && maximum > 0
+        {
             return Ok(maximum);
         }
 
-        let (maximum, _) = self.read_feature(position, field)?;
-        self.entries[position].maximum[slot(field)] = Some(maximum);
+        let (maximum, _) = self.read_feature(position)?;
+        self.entries[position].maximum = Some(maximum);
 
         if maximum == 0 {
             let index = self.entries[position].index;
-            return Err(MonitorError::NoRange {
-                index,
-                field: field.name(),
-            });
+            return Err(MonitorError::NoRange { index });
         }
 
         Ok(maximum)
@@ -313,13 +294,6 @@ impl MonitorController {
                 entry.index, entry.failures
             );
         }
-    }
-}
-
-fn slot(field: Field) -> usize {
-    match field {
-        Field::Brightness => 0,
-        Field::Contrast => 1,
     }
 }
 
@@ -363,11 +337,11 @@ mod tests {
 
         let percent = monitor.brightness.expect("checked above");
         controller
-            .set(monitor.index, Field::Brightness, percent)
+            .set(monitor.index, percent)
             .expect("writing the current brightness back must succeed");
 
         let confirmed = controller
-            .read(monitor.index, Field::Brightness)
+            .read(monitor.index)
             .expect("read after write")
             .expect("range available");
         assert_eq!(

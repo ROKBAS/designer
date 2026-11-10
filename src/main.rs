@@ -2,9 +2,9 @@
 
 //! DDC/CI monitor brightness tray application.
 //!
-//! The tray icon exposes per-monitor brightness and contrast controls. All
-//! hardware access happens on a worker thread; see [`worker`] and
-//! [`monitor::controller`] for details.
+//! The tray icon exposes one submenu per monitor holding a flat list of
+//! brightness values from 0% to 100%. All hardware access happens on a worker
+//! thread; see [`worker`] and [`monitor::controller`] for details.
 
 mod app;
 mod config;

@@ -1,4 +1,4 @@
-//! Tray icon lifecycle: creation, menu rebuilds, labels and tooltip.
+//! Tray icon lifecycle: creation, menu rebuilds, checkmarks and tooltip.
 
 pub mod icon;
 pub mod menu;
@@ -8,7 +8,7 @@ use tray_icon::menu::MenuId;
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::error::AppResult;
-use crate::monitor::{Field, MonitorSnapshot};
+use crate::monitor::MonitorSnapshot;
 use menu::{Action, MenuHandles};
 
 const BASE_TOOLTIP: &str = "DDC/CI monitor brightness";
@@ -18,7 +18,6 @@ pub struct Tray {
     icon: TrayIcon,
     handles: MenuHandles,
     monitors: Vec<MonitorSnapshot>,
-    step: u8,
     /// False until the first monitor snapshot arrives, so the initial
     /// "Detecting monitors..." placeholder is always replaced even when no
     /// displays were found.
@@ -28,8 +27,8 @@ pub struct Tray {
 impl Tray {
     /// Create the tray icon with a placeholder menu while monitors are being
     /// detected.
-    pub fn new(step: u8) -> AppResult<Self> {
-        let built = menu::build(&[], step, true);
+    pub fn new() -> AppResult<Self> {
+        let built = menu::build(&[], true);
         let icon = TrayIconBuilder::new()
             .with_icon(icon::app_icon()?)
             .with_tooltip(BASE_TOOLTIP)
@@ -40,20 +39,16 @@ impl Tray {
             icon,
             handles: built.handles,
             monitors: Vec::new(),
-            step,
             initialized: false,
         })
     }
 
-    /// Current displayed value of a field, including optimistic updates.
-    pub fn value(&self, index: u32, field: Field) -> Option<u8> {
+    /// Current displayed brightness, including optimistic updates.
+    pub fn value(&self, index: u32) -> Option<u8> {
         self.monitors
             .iter()
             .find(|monitor| monitor.index == index)
-            .and_then(|monitor| match field {
-                Field::Brightness => monitor.brightness,
-                Field::Contrast => monitor.contrast,
-            })
+            .and_then(|monitor| monitor.brightness)
     }
 
     /// Resolve a native menu event id to an action.
@@ -62,37 +57,35 @@ impl Tray {
     }
 
     /// Replace the monitor list. The menu is rebuilt only when the set of
-    /// monitors changed; otherwise labels are updated in place.
+    /// monitors changed; otherwise checkmarks and titles are updated in place.
     pub fn set_monitors(&mut self, monitors: Vec<MonitorSnapshot>) {
         let rebuild = !self.initialized || signatures(&self.monitors) != signatures(&monitors);
         self.initialized = true;
         self.monitors = monitors;
 
         if rebuild {
-            let built = menu::build(&self.monitors, self.step, false);
+            let built = menu::build(&self.monitors, false);
             self.icon.set_menu(Some(Box::new(built.menu)));
             self.handles = built.handles;
         } else {
-            self.refresh_labels();
+            self.refresh_checks();
         }
 
         self.refresh_tooltip();
     }
 
-    /// Update one field optimistically (on click) or with a confirmed value.
-    pub fn set_field_value(&mut self, index: u32, field: Field, percent: Option<u8>) {
+    /// Update one monitor's brightness optimistically (on click) or with a
+    /// confirmed value.
+    pub fn set_brightness(&mut self, index: u32, percent: Option<u8>) {
         if let Some(monitor) = self.monitors.iter_mut().find(|m| m.index == index) {
-            match field {
-                Field::Brightness => monitor.brightness = percent,
-                Field::Contrast => monitor.contrast = percent,
-            }
+            monitor.brightness = percent;
         }
-        self.refresh_labels();
+        self.refresh_checks();
         self.refresh_tooltip();
     }
 
-    fn refresh_labels(&self) {
-        for monitor in &self.monitors {
+    fn refresh_checks(&self) {
+        for (position, monitor) in self.monitors.iter().enumerate() {
             let Some(entry) = self
                 .handles
                 .monitors
@@ -103,20 +96,14 @@ impl Tray {
             };
 
             entry
-                .brightness_label
-                .set_text(menu::brightness_text(monitor.brightness, false));
-            entry
-                .brightness_up
-                .set_enabled(monitor.brightness.is_some());
-            entry
-                .brightness_down
-                .set_enabled(monitor.brightness.is_some());
+                .submenu
+                .set_text(menu::monitor_title(monitor, position, false));
 
-            entry
-                .contrast_label
-                .set_text(menu::contrast_text(monitor.contrast, false));
-            entry.contrast_up.set_enabled(monitor.contrast.is_some());
-            entry.contrast_down.set_enabled(monitor.contrast.is_some());
+            let available = monitor.brightness.is_some();
+            for (percent, item) in &entry.values {
+                item.set_checked(monitor.brightness == Some(*percent));
+                item.set_enabled(available);
+            }
         }
     }
 

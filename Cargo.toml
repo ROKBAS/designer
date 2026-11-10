@@ -2,8 +2,11 @@
 name = "designer"
 version = "0.1.0"
 edition = "2024"
-description = "Tray application for DDC/CI monitor brightness and contrast control on Windows"
+rust-version = "1.90"
+description = "Tray application for DDC/CI monitor brightness control on Windows"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ROKBAS/designer"
 
 [dependencies]
 # DDC/CI. Only the Windows backend is needed; i2c/nvapi/macos backends stay disabled.

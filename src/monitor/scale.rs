@@ -1,9 +1,9 @@
 //! Conversion between user-facing percentages and raw VCP values.
 //!
 //! DDC/CI features report a maximum and current value. Monitors commonly use
-//! 0..=100 or 0..=255, but any range must be handled. All conversions round to
-//! the nearest value and clamp, so repeated `+`/`-` never drift outside the
-//! panel's range.
+//! 0..=100 or 0..=255, but any range must be handled. Conversions round to the
+//! nearest value and clamp, so a requested percentage always maps to a value
+//! the panel itself accepts.
 
 /// Highest percentage we expose.
 pub const MAX_PERCENT: u8 = 100;
@@ -32,12 +32,6 @@ pub fn raw_to_percent(current: u16, maximum: u16) -> Option<u8> {
     let current = u32::from(current.min(maximum as u16));
     let percent = (current * 100 + maximum / 2) / maximum;
     Some(percent.min(u32::from(MAX_PERCENT)) as u8)
-}
-
-/// Clamp a possibly-negative target to `[min_percent, 100]`.
-pub fn clamp_percent(value: i32, min_percent: u8) -> u8 {
-    let minimum = i32::from(min_percent.min(MAX_PERCENT));
-    value.clamp(minimum, i32::from(MAX_PERCENT)) as u8
 }
 
 #[cfg(test)]
@@ -92,15 +86,5 @@ mod tests {
     #[test]
     fn raw_to_percent_clamps_over_range_values() {
         assert_eq!(raw_to_percent(500, 255), Some(100));
-    }
-
-    #[test]
-    fn clamp_percent_respects_minimum_and_maximum() {
-        assert_eq!(clamp_percent(-10, 5), 5);
-        assert_eq!(clamp_percent(0, 5), 5);
-        assert_eq!(clamp_percent(45, 5), 45);
-        assert_eq!(clamp_percent(100, 5), 100);
-        assert_eq!(clamp_percent(150, 5), 100);
-        assert_eq!(clamp_percent(50, 200), 100);
     }
 }

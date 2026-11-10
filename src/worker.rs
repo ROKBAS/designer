@@ -12,19 +12,15 @@ use std::time::Duration;
 
 use log::debug;
 
-use crate::monitor::{Field, MonitorController, MonitorError, MonitorSnapshot};
+use crate::monitor::{MonitorController, MonitorError, MonitorSnapshot};
 
 /// Requests sent from the UI thread to the worker.
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// Drop handles, re-enumerate displays, then read every field.
+    /// Drop handles, re-enumerate displays, then read every monitor.
     Refresh,
-    /// Set a field to an absolute percentage.
-    Set {
-        index: u32,
-        field: Field,
-        percent: u8,
-    },
+    /// Set brightness to an absolute percentage.
+    SetBrightness { index: u32, percent: u8 },
     /// Stop the worker loop.
     Shutdown,
 }
@@ -37,19 +33,11 @@ pub enum WorkerEvent {
         monitors: Vec<MonitorSnapshot>,
         warning: Option<String>,
     },
-    /// A write succeeded and was verified (or fall back to the requested value
+    /// A write succeeded and was verified (falling back to the requested value
     /// when verification itself failed).
-    ValueConfirmed {
-        index: u32,
-        field: Field,
-        percent: Option<u8>,
-    },
-    /// A write failed; the UI should revert its optimistic label.
-    WriteFailed {
-        index: u32,
-        field: Field,
-        message: String,
-    },
+    BrightnessConfirmed { index: u32, percent: u8 },
+    /// A write failed; the UI should revert its optimistic checkmark.
+    WriteFailed { index: u32, message: String },
     /// Informational message worth logging, such as a failed verification.
     Info(String),
 }
@@ -62,8 +50,8 @@ pub type EventSink = Arc<dyn Fn(WorkerEvent) + Send + Sync + 'static>;
 pub trait DisplayBackend: 'static {
     fn refresh(&mut self) -> usize;
     fn snapshot(&mut self) -> Vec<MonitorSnapshot>;
-    fn read(&mut self, index: u32, field: Field) -> Result<Option<u8>, MonitorError>;
-    fn set(&mut self, index: u32, field: Field, percent: u8) -> Result<(), MonitorError>;
+    fn read(&mut self, index: u32) -> Result<Option<u8>, MonitorError>;
+    fn set(&mut self, index: u32, percent: u8) -> Result<(), MonitorError>;
 }
 
 impl DisplayBackend for MonitorController {
@@ -75,12 +63,12 @@ impl DisplayBackend for MonitorController {
         MonitorController::snapshot(self)
     }
 
-    fn read(&mut self, index: u32, field: Field) -> Result<Option<u8>, MonitorError> {
-        MonitorController::read(self, index, field)
+    fn read(&mut self, index: u32) -> Result<Option<u8>, MonitorError> {
+        MonitorController::read(self, index)
     }
 
-    fn set(&mut self, index: u32, field: Field, percent: u8) -> Result<(), MonitorError> {
-        MonitorController::set(self, index, field, percent)
+    fn set(&mut self, index: u32, percent: u8) -> Result<(), MonitorError> {
+        MonitorController::set(self, index, percent)
     }
 }
 
@@ -142,23 +130,19 @@ fn run<B: DisplayBackend>(mut backend: B, rx: Receiver<Command>, sink: EventSink
             .iter()
             .any(|command| matches!(command, Command::Refresh));
 
-        // Collapse repeated writes for the same field: only the final target
+        // Collapse repeated writes for the same monitor: only the final target
         // matters, so a burst of clicks costs one DDC command, not one per
         // click.
-        let mut writes: Vec<(u32, Field, u8)> = Vec::new();
+        let mut writes: Vec<(u32, u8)> = Vec::new();
         for command in &batch {
-            if let Command::Set {
-                index,
-                field,
-                percent,
-            } = *command
-            {
-                if let Some(slot) = writes.iter_mut().find(|(entry_index, entry_field, _)| {
-                    *entry_index == index && *entry_field == field
-                }) {
-                    slot.2 = percent;
+            if let Command::SetBrightness { index, percent } = *command {
+                if let Some(slot) = writes
+                    .iter_mut()
+                    .find(|(entry_index, _)| *entry_index == index)
+                {
+                    slot.1 = percent;
                 } else {
-                    writes.push((index, field, percent));
+                    writes.push((index, percent));
                 }
             }
         }
@@ -184,13 +168,12 @@ fn run<B: DisplayBackend>(mut backend: B, rx: Receiver<Command>, sink: EventSink
             continue;
         }
 
-        let mut dirty: Vec<(u32, Field, u8)> = Vec::new();
-        for (index, field, percent) in writes {
-            match backend.set(index, field, percent) {
-                Ok(()) => dirty.push((index, field, percent)),
+        let mut dirty: Vec<(u32, u8)> = Vec::new();
+        for (index, percent) in writes {
+            match backend.set(index, percent) {
+                Ok(()) => dirty.push((index, percent)),
                 Err(error) => sink(WorkerEvent::WriteFailed {
                     index,
-                    field,
                     message: error.to_string(),
                 }),
             }
@@ -206,24 +189,19 @@ fn run<B: DisplayBackend>(mut backend: B, rx: Receiver<Command>, sink: EventSink
         match rx.try_recv() {
             Ok(command) => pending = Some(command),
             Err(_) => {
-                for (index, field, requested) in dirty {
-                    let percent = match backend.read(index, field) {
-                        Ok(Some(value)) => Some(value),
-                        Ok(None) => Some(requested),
+                for (index, requested) in dirty {
+                    let percent = match backend.read(index) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => requested,
                         Err(error) => {
                             sink(WorkerEvent::Info(format!(
-                                "could not verify {} on monitor {}: {error}",
-                                field.name(),
+                                "could not verify brightness on monitor {}: {error}",
                                 index + 1
                             )));
-                            Some(requested)
+                            requested
                         }
                     };
-                    sink(WorkerEvent::ValueConfirmed {
-                        index,
-                        field,
-                        percent,
-                    });
+                    sink(WorkerEvent::BrightnessConfirmed { index, percent });
                 }
             }
         }
@@ -239,8 +217,8 @@ mod tests {
 
     #[derive(Default)]
     struct MockState {
-        sets: Vec<(u32, Field, u8)>,
-        reads: Vec<(u32, Field)>,
+        sets: Vec<(u32, u8)>,
+        reads: Vec<u32>,
         monitors: Vec<MonitorSnapshot>,
         refresh_count: usize,
         value: Option<u8>,
@@ -262,15 +240,15 @@ mod tests {
             self.state.lock().expect("lock").monitors.clone()
         }
 
-        fn read(&mut self, index: u32, field: Field) -> Result<Option<u8>, MonitorError> {
+        fn read(&mut self, index: u32) -> Result<Option<u8>, MonitorError> {
             let mut state = self.state.lock().expect("lock");
-            state.reads.push((index, field));
+            state.reads.push(index);
             Ok(state.value)
         }
 
-        fn set(&mut self, index: u32, field: Field, percent: u8) -> Result<(), MonitorError> {
+        fn set(&mut self, index: u32, percent: u8) -> Result<(), MonitorError> {
             let mut state = self.state.lock().expect("lock");
-            state.sets.push((index, field, percent));
+            state.sets.push((index, percent));
             if state.fail_sets {
                 Err(MonitorError::Command {
                     index,
@@ -323,20 +301,17 @@ mod tests {
         let state = mock_state(false);
         let (commands, events, handle) = start(
             vec![
-                Command::Set {
+                Command::SetBrightness {
                     index: 0,
-                    field: Field::Brightness,
-                    percent: 45,
+                    percent: 40,
                 },
-                Command::Set {
+                Command::SetBrightness {
                     index: 0,
-                    field: Field::Brightness,
                     percent: 50,
                 },
-                Command::Set {
+                Command::SetBrightness {
                     index: 0,
-                    field: Field::Brightness,
-                    percent: 55,
+                    percent: 60,
                 },
             ],
             state.clone(),
@@ -346,22 +321,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("confirmation event");
         match event {
-            WorkerEvent::ValueConfirmed {
-                index,
-                field,
-                percent,
-            } => {
+            WorkerEvent::BrightnessConfirmed { index, percent } => {
                 assert_eq!(index, 0);
-                assert_eq!(field, Field::Brightness);
-                assert_eq!(percent, Some(55));
+                assert_eq!(percent, 60);
             }
             other => panic!("unexpected event: {other:?}"),
         }
 
         {
             let state = state.lock().expect("lock");
-            assert_eq!(state.sets, vec![(0, Field::Brightness, 55)]);
-            assert_eq!(state.reads, vec![(0, Field::Brightness)]);
+            assert_eq!(state.sets, vec![(0, 60)]);
+            assert_eq!(state.reads, vec![0]);
         }
 
         commands.send(Command::Shutdown).expect("shutdown");
@@ -392,9 +362,8 @@ mod tests {
     fn failed_write_is_reported_without_confirmation() {
         let state = mock_state(true);
         let (commands, events, handle) = start(
-            vec![Command::Set {
+            vec![Command::SetBrightness {
                 index: 2,
-                field: Field::Contrast,
                 percent: 30,
             }],
             state,
@@ -404,13 +373,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("failure event");
         match event {
-            WorkerEvent::WriteFailed {
-                index,
-                field,
-                message,
-            } => {
+            WorkerEvent::WriteFailed { index, message } => {
                 assert_eq!(index, 2);
-                assert_eq!(field, Field::Contrast);
                 assert!(message.contains("mock failure"));
             }
             other => panic!("unexpected event: {other:?}"),
